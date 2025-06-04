@@ -1,7 +1,7 @@
 # Claude Code Session Picker 
 
 
-A terminal UI for browsing your **Claude Code** sessions, skimming AI‑generated summaries, and reopening a session with a single keystroke.
+A terminal UI for browsing your **Claude Code** sessions, skimming AI‑generated summaries, and reopening a session with a single keystroke.
 
 ---
 
@@ -20,92 +20,158 @@ A terminal UI for browsing your **Claude Code** sessions, skimming AI‑generat
 
 | Tool | Version |
 |------|---------|
-| Python | 3.6 or newer |
-| [`claude-cli`](https://github.com/anthropic/claude-cli) | `pip install claude-cli` |
-| Claude Code `.jsonl` session logs | (created automatically when you use Claude Code) |
+| Node.js | 18 or newer |
+| Claude Code CLI | `npm install -g @anthropic-ai/claude-code` |
+| Python | 3.6 or newer |
+| platformdirs (Python) | `pip install platformdirs` |
 
 ---
 
 ## ⚡ Installation
 
 ```bash
-# 1. Grab the script
-curl -O https://raw.githubusercontent.com/espositov/claude-session-picker/main/claude-session-picker.py
+# 1. Clone the repository
+git clone https://github.com/espositov/claude-session-picker.git
+cd claude-session-picker
+
+# 2. Make executable and install globally
 chmod +x claude-session-picker.py
+sudo ln -s "$(pwd)/claude-session-picker.py" /usr/local/bin/claude-session-picker
+sudo ln -s "$(pwd)/claude-session-picker.py" /usr/local/bin/cc-picker
 
-# 2. Install dependencies
-pip install claude-cli rich  # rich just makes the CLI output prettier
+# 3. Install dependencies
+npm install -g @anthropic-ai/claude-code   # Node 18+ required
+pip install platformdirs                  # Python helper for config paths
+```
 
-⸻
+Now you can run `claude-session-picker` or `cc-picker` from anywhere!
 
-🚀 Usage
+---
 
-python3 claude-session-picker.py
+## 🚀 Usage
 
-First run
-    1.    Script looks for ~/.claude/projects
-    2.    If missing, you point it to your Claude projects folder
-    3.    Session Summaries/ cache folder is created
-    4.    Settings saved to config.json next to the script
+```bash
+claude-session-picker
+# or use the short version:
+cc-picker
+```
 
-Everyday flow
-    1.    Pick a project
-    2.    Browse nicely boxed sessions with AI blurbs
-    3.    Press a number → session reopens in Claude Code
+### First Run Setup
+1. **Auto-detection**: Script looks for `~/.claude/projects`
+2. **Manual setup**: If not found, you'll be prompted:
+   ```
+   Default Claude projects directory not found.
+   Enter path to Claude projects directory: /your/custom/path
+   Session summaries directory [/Users/you/.claude/Session Summaries]: 
+   ```
+3. **Config saved**: Settings stored in OS-appropriate config directory
 
-⸻
+### Everyday Workflow
 
-🔍 How it works
+**Step 1: Select Project**
+```
+================================================================================
+SELECT PROJECT DIRECTORY  
+================================================================================
+ 1. my-app
+    15 sessions • Jun 04, 2025 at 03:12 PM
+ 2. website-redesign  
+    8 sessions • Jun 03, 2025 at 02:21 PM
+ 3. data-analysis
+    23 sessions • Jun 02, 2025 at 08:14 PM
 
-Stage    What it does
-Scan    Finds all .jsonl files under the projects folder
-Summarise    Sends trimmed convo snippets to claude CLI; caches result
-Cache    Per‑project JSON cache lives in Session Summaries/
-Launch    Runs claude -r <session_id> inside the correct directory
+Select project (1-3) or 'q' to quit: 1
+```
 
+**Step 2: Browse Sessions**
+```
+================================================================================
+CLAUDE CODE SESSION PICKER
+================================================================================
+```
+*(See example output below for the full session display)*
 
-⸻
+**Step 3: Launch Session**
+```
+Select session (1-15) or 'q' to quit: 3
 
-⚙️ Configuration
+Launching Claude Code session in: /Users/you/my-app
+Session ID: 'abc123def456...'
+```
 
+---
+
+## 🔍 How it works
+
+| Stage | What it does |
+|-------|-------------|
+| Scan | Finds all .jsonl files under the projects folder |
+| Summarise | Sends trimmed convo snippets to claude CLI; caches result |
+| Cache | Per‑project JSON cache lives in Session Summaries/ |
+| Launch | Runs claude -r <session_id> inside the correct directory |
+
+---
+
+## ⚙️ Configuration
+
+```json
 // config.json (auto‑generated)
 {
   "claude_projects_dir": "/Users/you/.claude/projects",
   "session_summaries_dir": "/Users/you/.claude/Session Summaries"
 }
+```
 
 Delete this file to rerun the wizard.
 
-⸻
+---
 
-🪄 Example output
+## 🪄 Example Session Display
 
-===============================================================================
+```
+================================================================================
 CLAUDE CODE SESSION PICKER
-===============================================================================
+================================================================================
 
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ 1. Mar 17, 2:30 PM │ my‑project │ 24 msgs │ abc123def456…                  │
+│ 1. Jun 04, 3:12 PM │ my-app │ 24 msgs │ abc123def456…                      │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ Summary: Created Python script                                               │
-│ • Fixed API errors                                                           │
-│ • Added caching system                                                       │
+│ • Fixed API authentication errors                                            │
+│ • Added response caching system                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 2. Jun 03, 2:45 PM │ my-app │ 18 msgs │ def789ghi012…                      │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Summary: Database optimization                                               │
+│ • Implemented connection pooling                                             │
+│ • Added query performance monitoring                                         │
+└──────────────────────────────────────────────────────────────────────────────┘
 
-⸻
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 3. Jun 02, 8:14 PM │ my-app │ 31 msgs │ ghi345jkl678…                      │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Summary: UI component refactoring                                            │
+│ • Migrated to TypeScript                                                     │
+│ • Created reusable button components                                         │
+└──────────────────────────────────────────────────────────────────────────────┘
 
-🚑 Troubleshooting
+Select session (1-3) or 'q' to quit: 
+```
 
-Problem    Fix
-“Claude CLI not found”    pip install claude-cli
-“No sessions found”    Confirm claude_projects_dir path and that .jsonl logs exist
-Permission denied    Ensure read/write access to the projects and summaries dirs
+---
 
+## 🚑 Troubleshooting
 
-⸻
+| Problem | Fix |
+|---------|-----|
+| "Claude CLI not found" | `pip install claude-cli` |
+| "No sessions found" | Confirm claude_projects_dir path and that .jsonl logs exist |
+| Permission denied | Ensure read/write access to the projects and summaries dirs |
 
-🤝 Contributing
+---
+
+## 🤝 Contributing
 
 Pull requests and issues welcome! Please run ruff / black before opening a PR.
-
