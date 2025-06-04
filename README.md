@@ -30,13 +30,11 @@ A terminal UI for browsing your **Claude Code** sessions, skimming AI‑generat
 
 ```bash
 # 1. Grab the script
-curl -O https://raw.githubusercontent.com/<your‑github>/claude-session-picker/main/claude-session-picker.py
+curl -O https://raw.githubusercontent.com/espositov/claude-session-picker/main/claude-session-picker.py
 chmod +x claude-session-picker.py
 
 # 2. Install dependencies
 pip install claude-cli rich  # rich just makes the CLI output prettier
-
-(Replace <your‑github> with your username once you push the repo.)
 
 ⸻
 
