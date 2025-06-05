@@ -36,11 +36,16 @@ from typing import List, Dict, Tuple
 from datetime import datetime
 import tempfile
 from platformdirs import user_config_dir
+from tabulate import tabulate
+from colorama import init, Fore, Style
+
+# Initialize colorama for cross-platform colored output
+init(autoreset=True)
 
 # Configuration - will be set by setup process
 CLAUDE_PROJECTS_DIR = None
 SESSION_SUMMARIES_DIR = None
-MAX_CONTENT_LENGTH = 2000  # Limit content sent for summarization
+MAX_CONTENT_LENGTH = 20000  # Limit content sent for summarization
 CONFIG_PATH = Path(user_config_dir("claude-session-picker")) / "config.json"
 
 
@@ -79,37 +84,69 @@ class SessionFile:
         return conversations
     
     def extract_content_for_summary(self) -> str:
-        """Extract relevant content for AI summarization"""
+        """Extract key topics and actions for AI summarization"""
         content_parts = []
         
-        # Look for existing summary entries first
-        summaries = [conv.get('summary', '') for conv in self.conversations 
+        # Look for existing summary entries but only use if they're descriptive
+        summaries = [conv.get('summary', '') for conv in self.conversations
                     if conv.get('type') == 'summary' and conv.get('summary')]
-        if summaries:
-            return ' | '.join(summaries[:3])  # Use existing summaries
         
-        # Extract user messages and assistant responses
+        # Skip generic/short summaries - only use if they're descriptive enough
+        good_summaries = [s for s in summaries if len(s) > 50 and not any(generic in s.lower() for generic in ['config', 'path', 'picker', 'session', 'claude code'])]
+        if good_summaries:
+            return ' | '.join(good_summaries[:3])  # Use only good existing summaries
+        
+        # Smart extraction - focus on key patterns
+        user_requests = []
+        assistant_actions = []
+        tool_uses = []
+        
         for conv in self.conversations:
             if conv.get('type') == 'user':
                 message = conv.get('message', {})
-                if isinstance(message, dict) and 'content' in message:
-                    content = message['content']
-                    if isinstance(content, str) and content.strip():
-                        content_parts.append(f"User: {content[:200]}")
+                content = message.get('content', '')
+                if isinstance(content, str) and content.strip():
+                    # Extract user requests/questions (first sentence or up to 100 chars)
+                    first_sentence = content.split('.')[0].split('?')[0].split('!')[0]
+                    user_requests.append(first_sentence[:100])
+                    
             elif conv.get('type') == 'assistant':
                 message = conv.get('message', {})
-                if isinstance(message, dict) and 'content' in message:
-                    content = message['content']
-                    if isinstance(content, list):
-                        for item in content:
-                            if isinstance(item, dict) and item.get('type') == 'text':
-                                text = item.get('text', '')[:200]
-                                if text.strip():
-                                    content_parts.append(f"Assistant: {text}")
-                                    break
+                content = message.get('content', [])
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict):
+                            if item.get('type') == 'text':
+                                text = item.get('text', '')
+                                # Look for action words/key phrases
+                                if any(word in text.lower() for word in ['create', 'update', 'fix', 'add', 'remove', 'install', 'configure', 'debug', 'implement']):
+                                    assistant_actions.append(text[:150])
+                            elif item.get('type') == 'tool_use':
+                                tool_name = item.get('name', '')
+                                tool_input = item.get('input', {})
+                                if tool_name and tool_input:
+                                    # Capture what tools were used
+                                    desc = tool_input.get('description', tool_input.get('command', ''))
+                                    tool_uses.append(f"{tool_name}: {desc[:100]}")
         
-        # Limit total content length
-        result = ' | '.join(content_parts)
+        # Combine the most relevant parts
+        summary_parts = []
+        if user_requests:
+            summary_parts.extend(f"User: {req}" for req in user_requests[:3])
+        if assistant_actions:
+            summary_parts.extend(f"Action: {action}" for action in assistant_actions[:2])
+        if tool_uses:
+            summary_parts.extend(f"Tool: {tool}" for tool in tool_uses[:2])
+        
+        # If no smart content found, fall back to basic extraction
+        if not summary_parts:
+            for conv in self.conversations[:5]:  # Just first 5 messages
+                if conv.get('type') == 'user':
+                    content = conv.get('message', {}).get('content', '')
+                    if isinstance(content, str) and content.strip():
+                        summary_parts.append(f"User: {content[:100]}")
+        
+        result = ' | '.join(summary_parts)
         if len(result) > MAX_CONTENT_LENGTH:
             result = result[:MAX_CONTENT_LENGTH] + "..."
         
@@ -218,7 +255,7 @@ Summary:"""
     try:
         # Use Claude CLI in single prompt mode
         result = subprocess.run([
-            'claude', 
+            'claude',
             '-p', prompt
         ], capture_output=True, text=True, timeout=30)
         
@@ -240,12 +277,16 @@ Summary:"""
 
 
 def display_project_directories(project_dirs: List[Path]) -> None:
-    """Display available project directories"""
+    """Display available project directories in professional table format"""
     from datetime import datetime
     
-    print("\n" + "="*80)
-    print("SELECT PROJECT DIRECTORY")
-    print("="*80)
+    print(f"\n{Fore.CYAN}{'='*80}")
+    print(f"{Fore.CYAN}SELECT PROJECT DIRECTORY")
+    print(f"{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
+    
+    # Prepare table data
+    table_data = []
+    headers = ["#", "Project Name", "Sessions", "Last Modified"]
     
     for i, project_dir in enumerate(project_dirs, 1):
         modified_time = project_dir.stat().st_mtime
@@ -261,8 +302,28 @@ def display_project_directories(project_dirs: List[Path]) -> None:
         if display_name.startswith(user_prefix):
             display_name = display_name.replace(user_prefix, '').replace('-', '/')
         
-        print(f"{i:2d}. {display_name}")
-        print(f"    {session_count} session{'s' if session_count != 1 else ''} • {modified_str}")
+        # Truncate very long project names
+        if len(display_name) > 40:
+            display_name = display_name[:37] + "..."
+        
+        # Color the row number and session count
+        row_num = f"{Fore.YELLOW}{i}{Style.RESET_ALL}"
+        session_display = f"{Fore.GREEN}{session_count}{Style.RESET_ALL} session{'s' if session_count != 1 else ''}"
+        
+        table_data.append([
+            row_num,
+            display_name,
+            session_display,
+            modified_str
+        ])
+    
+    # Print the table with professional formatting
+    print(tabulate(
+        table_data,
+        headers=[f"{Fore.CYAN}{h}{Style.RESET_ALL}" for h in headers],
+        tablefmt="fancy_grid",
+        colalign=["center", "left", "right", "left"]
+    ))
 
 
 def get_project_selection(project_dirs: List[Path]) -> Path:
@@ -289,67 +350,54 @@ def get_project_selection(project_dirs: List[Path]) -> Path:
 
 
 def display_sessions(sessions: List[SessionFile], project_name: str) -> None:
-    """Display sessions with summaries in box format"""
+    """Display sessions with summaries in professional table format"""
     from datetime import datetime
     
-    print("\n" + "="*80)
-    print("CLAUDE CODE SESSION PICKER")
-    print("="*80)
+    print(f"\n{Fore.CYAN}{'='*80}")
+    print(f"{Fore.CYAN}CLAUDE CODE SESSION PICKER - {project_name}")
+    print(f"{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
     
     if not sessions:
         print("No sessions found in this project.")
         return
     
-    box_width = 78
+    # Prepare table data
+    table_data = []
+    headers = ["#", "Date", "Time", "Messages", "Session ID", "Summary"]
     
     for i, session in enumerate(sessions, 1):
         modified_time = datetime.fromtimestamp(session.modified_time)
-        date_str = modified_time.strftime("%b %d, %I:%M %p")
+        date_str = modified_time.strftime("%b %d")
+        time_str = modified_time.strftime("%I:%M %p")
         
-        # Clean project name for display
-        display_project = project_name
-        if len(display_project) > 20:
-            display_project = display_project[:17] + "..."
+        # Truncate session ID for display
+        session_id_display = session.session_id[:12] + "..." if len(session.session_id) > 15 else session.session_id
         
-        # Truncate session ID for header
-        session_id_short = session.session_id[:16] + "..."
+        # Use full summary without truncation
+        summary_display = session.summary
         
-        # Create header line
-        header = f"{i}. {date_str} │ {display_project} │ {session.message_count} msgs │ {session_id_short}"
+        # Color the row number
+        row_num = f"{Fore.YELLOW}{i}{Style.RESET_ALL}"
+        msg_count = f"{Fore.GREEN}{session.message_count}{Style.RESET_ALL}"
         
-        # Top border
-        print("┌" + "─" * box_width + "┐")
-        
-        # Header with padding
-        padding = max(0, box_width - len(header))
-        print(f"│ {header}{' ' * padding} │")
-        
-        # Middle border if there's a summary
-        if session.summary:
-            print("├" + "─" * box_width + "┤")
-            
-            # Summary title
-            summary_title = "Summary: " + session.summary.split('.')[0] if session.summary else "Summary:"
-            if len(summary_title) > box_width - 4:
-                summary_title = summary_title[:box_width - 7] + "..."
-            title_padding = max(0, box_width - len(summary_title))
-            print(f"│ {summary_title}{' ' * title_padding} │")
-            
-            # Summary bullet points
-            summary_lines = session.summary.split('. ')
-            for line in summary_lines[1:]:  # Skip first part (already used in title)
-                if line.strip():
-                    clean_line = line.strip().lstrip('•-– ').rstrip('.')
-                    if clean_line:
-                        bullet_line = f"• {clean_line}"
-                        if len(bullet_line) > box_width - 4:
-                            bullet_line = bullet_line[:box_width - 7] + "..."
-                        bullet_padding = max(0, box_width - len(bullet_line))
-                        print(f"│ {bullet_line}{' ' * bullet_padding} │")
-        
-        # Bottom border
-        print("└" + "─" * box_width + "┘")
-        print()  # Space between boxes
+        table_data.append([
+            row_num,
+            date_str,
+            time_str,
+            msg_count,
+            session_id_display,
+            summary_display
+        ])
+    
+    # Print the table with professional formatting
+    print(tabulate(
+        table_data,
+        headers=[f"{Fore.CYAN}{h}{Style.RESET_ALL}" for h in headers],
+        tablefmt="fancy_grid",
+        colalign=["center", "center", "center", "center", "left", "left"],
+        maxcolwidths=[None, None, None, None, 15, 40]
+    ))
+    print()  # Add spacing after table
 
 
 def get_session_selection(sessions: List[SessionFile]) -> SessionFile:
@@ -440,13 +488,13 @@ def launch_session(session: SessionFile) -> None:
             print("Launching without changing directory...")
             # Launch without changing directory
             subprocess.run([
-                'claude', 
+                'claude',
                 '-r', clean_session_id
             ])
         else:
             # Launch claude with -r flag in the actual project directory
             subprocess.run([
-                'claude', 
+                'claude',
                 '-r', clean_session_id
             ], cwd=actual_project_path)
         
@@ -586,7 +634,7 @@ def get_custom_paths() -> bool:
 def check_claude_cli() -> bool:
     """Check if Claude CLI is available"""
     try:
-        result = subprocess.run(['claude', '--version'], 
+        result = subprocess.run(['claude', '--version'],
                               capture_output=True, text=True, timeout=5)
         return result.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
