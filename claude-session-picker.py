@@ -5,7 +5,7 @@ Claude Code Session Picker
 A wrapper script that reads Claude Code session files, uses AI to summarize each chat,
 and provides an interactive interface to select and launch sessions.
 
-Features:
+Features:x
 - First-time setup to configure your Claude Code directories
 - Automatic detection of session files
 - AI-powered session summaries using Claude CLI
@@ -32,15 +32,32 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional, Union
 from datetime import datetime
 import tempfile
+import re
+import textwrap
 from platformdirs import user_config_dir
 from tabulate import tabulate
 from colorama import init, Fore, Style
 
 # Initialize colorama for cross-platform colored output
 init(autoreset=True)
+
+# JSON key constants
+TYPE_KEY = 'type'
+MESSAGE_KEY = 'message'
+CONTENT_KEY = 'content'
+SUMMARY_KEY = 'summary'
+TEXT_KEY = 'text'
+TOOL_USE_KEY = 'tool_use'
+NAME_KEY = 'name'
+INPUT_KEY = 'input'
+
+# Message types
+USER_TYPE = 'user'
+ASSISTANT_TYPE = 'assistant'
+SUMMARY_TYPE = 'summary'
 
 # Configuration - will be set by setup process
 CLAUDE_PROJECTS_DIR = None
@@ -57,10 +74,13 @@ class SessionFile:
         self.modified_time = file_path.stat().st_mtime
         self.size = file_path.stat().st_size
         self.project_dir = file_path.parent.name
+        self.project_dir_full_path = file_path.parent  # Store the full path
         self.session_id = file_path.stem
         self.conversations = []
         self.summary = ""
         self.message_count = 0
+        self.is_continuation = False
+        self.continued_from_session = None
         
     def load_conversations(self) -> List[Dict]:
         """Load and parse conversation data from the JSONL file"""
@@ -79,12 +99,42 @@ class SessionFile:
             print(f"Error reading {self.file_path}: {e}")
         
         self.conversations = conversations
-        # Count messages (user and assistant types)
-        self.message_count = len([conv for conv in conversations if conv.get('type') in ['user', 'assistant']])
+        
+        # Check if this is a continuation session
+        sidechain_messages = [conv for conv in conversations if conv.get('isSidechain', False)]
+        if sidechain_messages:
+            self.is_continuation = True
+        
+        # Also check for continuation pattern in messages
+        if not self.is_continuation:
+            for conv in conversations:
+                # Check user messages for continuation pattern
+                if conv.get('type') == 'user':
+                    message = conv.get('message', {})
+                    content = message.get('content', '')
+                    if isinstance(content, str) and 'This session is being continued from' in content:
+                        self.is_continuation = True
+                        # Extract session ID if mentioned
+                        import re
+                        session_match = re.search(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', content)
+                        if session_match:
+                            self.continued_from_session = session_match.group(1)
+                        break
+        
+        # Count only user messages - exclude sidechain (continued) messages and tool results
+        user_messages = []
+        for conv in conversations:
+            if conv.get('type') == 'user' and not conv.get('isSidechain', False):
+                message = conv.get('message', {})
+                content = message.get('content', '')
+                # Skip tool result messages (they start with array of tool results)
+                if isinstance(content, str) and not content.strip().startswith('[{"tool_use_id"'):
+                    user_messages.append(conv)
+        self.message_count = len(user_messages)
         return conversations
     
     def extract_content_for_summary(self) -> str:
-        """Extract key topics and actions for AI summarization"""
+        """Extract key topics and actions for AI summarization - prioritize user messages"""
         content_parts = []
         
         # Look for existing summary entries but only use if they're descriptive
@@ -96,21 +146,53 @@ class SessionFile:
         if good_summaries:
             return ' | '.join(good_summaries[:3])  # Use only good existing summaries
         
-        # Smart extraction - focus on key patterns
+        # Smart extraction - use same logic as message counter to find real user messages
+        user_messages = []
+        for conv in self.conversations:
+            if conv.get('type') == 'user' and not conv.get('isSidechain', False):
+                message = conv.get('message', {})
+                content = message.get('content', '')
+                # Skip tool result messages (they start with array of tool results)
+                if isinstance(content, str) and not content.strip().startswith('[{"tool_use_id"'):
+                    user_messages.append(conv)
+        
+        # Select key user messages: first 2, last 2, and 2 from middle
+        total_user_msgs = len(user_messages)
+        if total_user_msgs <= 6:
+            priority_user_messages = user_messages
+        else:
+            # Take first 2, last 2, and 2 from middle
+            first_two = user_messages[:2]
+            last_two = user_messages[-2:]
+            # Take 2 messages from around the middle
+            mid_point = total_user_msgs // 2
+            middle_two = user_messages[mid_point-1:mid_point+1] if mid_point > 1 else []
+            priority_user_messages = first_two + middle_two + last_two
+        
+        # Step 1: Extract user requests - take first 200 chars of each message
         user_requests = []
+        for conv in priority_user_messages:
+            message = conv.get('message', {})
+            content = message.get('content', '')
+            if isinstance(content, str) and content.strip():
+                cleaned_content = content.strip()
+                # Skip very short messages like "ok", "yes", "thanks"
+                if len(cleaned_content) > 10:
+                    # Focus on the action - take first 200 chars which usually contain the main request
+                    action_focused = cleaned_content[:200]
+                    user_requests.append(action_focused)
+        
+        # Step 2: If user messages provide enough context (>200 chars), use only those
+        user_context = ' | '.join(user_requests)
+        if len(user_context) > 200:
+            return user_context
+        
+        # Step 3: If not enough user context, add assistant actions and tool uses
         assistant_actions = []
         tool_uses = []
         
-        for conv in self.conversations:
-            if conv.get('type') == 'user':
-                message = conv.get('message', {})
-                content = message.get('content', '')
-                if isinstance(content, str) and content.strip():
-                    # Extract user requests/questions (first sentence or up to 100 chars)
-                    first_sentence = content.split('.')[0].split('?')[0].split('!')[0]
-                    user_requests.append(first_sentence[:100])
-                    
-            elif conv.get('type') == 'assistant':
+        for conv in priority_conversations:
+            if conv.get('type') == 'assistant' and not conv.get('isSidechain', False):
                 message = conv.get('message', {})
                 content = message.get('content', [])
                 if isinstance(content, list):
@@ -125,9 +207,44 @@ class SessionFile:
                                 tool_name = item.get('name', '')
                                 tool_input = item.get('input', {})
                                 if tool_name and tool_input:
-                                    # Capture what tools were used
-                                    desc = tool_input.get('description', tool_input.get('command', ''))
-                                    tool_uses.append(f"{tool_name}: {desc[:100]}")
+                                    # Enhanced parsing for official Claude Code tools
+                                    desc_parts = []
+                                    # Core file tools
+                                    if tool_name == 'Read' and 'file_path' in tool_input:
+                                        desc_parts.append(f"read: {tool_input['file_path']}")
+                                    elif tool_name in ['Edit', 'MultiEdit'] and 'file_path' in tool_input:
+                                        desc_parts.append(f"edited: {tool_input['file_path']}")
+                                    elif tool_name == 'Write' and 'file_path' in tool_input:
+                                        desc_parts.append(f"wrote: {tool_input['file_path']}")
+                                    # Terminal tools
+                                    elif tool_name == 'Bash' and 'command' in tool_input:
+                                        desc_parts.append(f"ran: {tool_input['command'][:70]}")
+                                    # Search tools
+                                    elif tool_name in ['LS', 'Glob', 'Grep'] and 'path' in tool_input:
+                                        desc_parts.append(f"searched: {tool_input['path']}")
+                                    elif tool_name == 'Grep' and 'pattern' in tool_input:
+                                        desc_parts.append(f"grepped: {tool_input['pattern']}")
+                                    # Notebook tools
+                                    elif tool_name in ['NotebookRead', 'NotebookEdit'] and 'notebook_path' in tool_input:
+                                        desc_parts.append(f"notebook: {tool_input['notebook_path']}")
+                                    # Todo tools
+                                    elif tool_name in ['TodoRead', 'TodoWrite']:
+                                        desc_parts.append("managed todos")
+                                    # Web tools
+                                    elif tool_name in ['WebFetch', 'WebSearch'] and 'url' in tool_input:
+                                        desc_parts.append(f"web: {tool_input['url']}")
+                                    elif tool_name == 'WebSearch' and 'query' in tool_input:
+                                        desc_parts.append(f"searched: {tool_input['query']}")
+                                    # Fallback to common fields
+                                    elif 'description' in tool_input:
+                                        desc_parts.append(tool_input['description'][:70])
+                                    elif 'command' in tool_input:
+                                        desc_parts.append(tool_input['command'][:70])
+                                    
+                                    if desc_parts:
+                                        tool_uses.append(f"Tool '{tool_name}': {desc_parts[0]}")
+                                    else:
+                                        tool_uses.append(f"Tool '{tool_name}': {str(tool_input)[:70]}")
         
         # Combine the most relevant parts
         summary_parts = []
@@ -141,16 +258,37 @@ class SessionFile:
         # If no smart content found, fall back to basic extraction
         if not summary_parts:
             for conv in self.conversations[:5]:  # Just first 5 messages
-                if conv.get('type') == 'user':
+                if conv.get('type') == 'user' and not conv.get('isSidechain', False):
                     content = conv.get('message', {}).get('content', '')
                     if isinstance(content, str) and content.strip():
-                        summary_parts.append(f"User: {content[:100]}")
+                        # Skip tool result messages
+                        if not content.strip().startswith('[{"tool_use_id"'):
+                            summary_parts.append(f"User: {content[:100]}")
         
         result = ' | '.join(summary_parts)
         if len(result) > MAX_CONTENT_LENGTH:
             result = result[:MAX_CONTENT_LENGTH] + "..."
         
         return result or "Empty conversation"
+
+
+def decode_project_path(encoded_name: str) -> str:
+    """Decode the project directory name back to actual file path"""
+    username = os.getenv('USER', 'user')
+    
+    # Handle the encoded format: -Users-username-Desktop-project-name
+    # This format uses - as path separator
+    if encoded_name.startswith('-Users-'):
+        # Split by - and reconstruct the path
+        parts = encoded_name.split('-')
+        # Remove empty first element from leading -
+        if parts[0] == '':
+            parts = parts[1:]
+        # Reconstruct as actual path
+        return '/' + '/'.join(parts)
+    else:
+        # If it doesn't match expected format, return as-is
+        return encoded_name
 
 
 def find_project_directories() -> List[Path]:
@@ -198,8 +336,10 @@ def load_cache_for_project(project_dir: Path) -> Dict:
         if cache_file.exists():
             with open(cache_file, 'r', encoding='utf-8') as f:
                 return json.load(f)
+    except json.JSONDecodeError:
+        print(f"{Fore.YELLOW}Warning: Cache file corrupted for {project_dir.name}. Ignoring cache.{Style.RESET_ALL}")
     except Exception as e:
-        print(f"Warning: Could not load cache for {project_dir.name}: {e}")
+        print(f"{Fore.YELLOW}Warning: Could not load cache for {project_dir.name}: {e}{Style.RESET_ALL}")
     return {}
 
 
@@ -221,8 +361,10 @@ def get_cached_summary(session: SessionFile, cache: Dict) -> str:
         cached_data = cache[file_key]
         # Check if cached summary is still valid (file hasn't been modified)
         if cached_data.get('modified_time') == session.modified_time:
-            # Also restore the message count from cache
+            # Also restore the message count and continuation info from cache
             session.message_count = cached_data.get('message_count', 0)
+            session.is_continuation = cached_data.get('is_continuation', False)
+            session.continued_from_session = cached_data.get('continued_from_session', None)
             return cached_data.get('summary', '')
     return None
 
@@ -235,7 +377,9 @@ def cache_summary(session: SessionFile, summary: str, cache: Dict) -> None:
         'modified_time': session.modified_time,
         'session_id': session.session_id,
         'project_dir': session.project_dir,
-        'message_count': session.message_count
+        'message_count': session.message_count,
+        'is_continuation': session.is_continuation,
+        'continued_from_session': session.continued_from_session
     }
 
 
@@ -244,27 +388,47 @@ def summarize_with_claude(content: str) -> str:
     if not content or content.strip() == "Empty conversation":
         return "Empty or unreadable conversation"
     
-    prompt = f"""Summarize this Claude Code conversation as 2-3 short bullet points (each 3-8 words), focusing on the main tasks or topics:
+    prompt = f"""Summarize what was accomplished in this Claude Code session. Format your response as bullet points using numbered format.
 
-{content}
+Focus on key actions taken, operations performed, or significant tools used.
+Provide 2-3 brief numbered bullet points. Each bullet point should be 3-5 words only.
+Use numbered bullet point format with each point on a separate line.
+Start directly with the numbered points - no preamble text.
+Use plain text only - no markdown formatting, no bold, no italics, no asterisks.
 
-Format as bullet points separated by periods. Example: "Created Python script. Fixed API errors. Added caching system."
-
-Summary:"""
+Session Activities:
+{content}"""
     
     try:
         # Use Claude CLI in single prompt mode
         result = subprocess.run([
             'claude',
             '-p', prompt
-        ], capture_output=True, text=True, timeout=30)
+        ], capture_output=True, text=True, timeout=45)
         
         if result.returncode == 0:
             summary = result.stdout.strip()
-            # Clean up the summary
-            if summary.startswith("Summary:"):
-                summary = summary[8:].strip()
-            return summary[:150] if summary else "Unable to generate summary"
+            # Strip preamble text - look for pattern ending with numbered list
+            # If summary contains numbered points, extract just the numbered portion
+            if re.search(r'\d+\.', summary):
+                # Find the start of the numbered list
+                numbered_match = re.search(r'(\d+\.\s+.*)', summary, re.DOTALL)
+                if numbered_match:
+                    summary = numbered_match.group(1)
+            
+            # Further cleanup: remove leading asterisks or dashes if they are part of the text from Claude
+            summary = re.sub(r"^\s*[\*\-]\s*", "", summary)  # Remove leading bullet point character if present
+            
+            # Remove markdown formatting (bold, italic, etc.)
+            summary = re.sub(r'\*\*(.*?)\*\*', r'\1', summary)  # Remove **bold** formatting
+            summary = re.sub(r'\*(.*?)\*', r'\1', summary)      # Remove *italic* formatting
+            
+            # 🔽 NEW: force each "1." "2." … onto its own line
+            summary = re.sub(r'\s*(\d+\.)\s+', r'\n\1 ', summary).lstrip('\n')
+            
+            # Clean up extra spaces
+            summary = re.sub(r" {2,}", " ", summary).strip()
+            return summary[:400] if summary else "Unable to generate summary (empty response)"
         else:
             return f"CLI error: {result.stderr[:50]}"
             
@@ -296,11 +460,12 @@ def display_project_directories(project_dirs: List[Path]) -> None:
         session_count = len(list(project_dir.glob("*.jsonl")))
         
         # Clean up project name for display
-        display_name = project_dir.name
+        display_name = decode_project_path(project_dir.name)
+        # Remove /Users/username prefix for cleaner display
         username = os.getenv('USER', 'user')
-        user_prefix = f'-Users-{username}-'
-        if display_name.startswith(user_prefix):
-            display_name = display_name.replace(user_prefix, '').replace('-', '/')
+        home_prefix = f'/Users/{username}/'
+        if display_name.startswith(home_prefix):
+            display_name = '~/' + display_name[len(home_prefix):]
         
         # Truncate very long project names
         if len(display_name) > 40:
@@ -363,18 +528,41 @@ def display_sessions(sessions: List[SessionFile], project_name: str) -> None:
     
     # Prepare table data
     table_data = []
-    headers = ["#", "Date", "Time", "Messages", "Session ID", "Summary"]
+    headers = ["#", "Date", "Msgs", "Summary"]
     
     for i, session in enumerate(sessions, 1):
         modified_time = datetime.fromtimestamp(session.modified_time)
         date_str = modified_time.strftime("%b %d")
         time_str = modified_time.strftime("%I:%M %p")
+        datetime_str = f"{date_str}\n{time_str}"
         
         # Truncate session ID for display
         session_id_display = session.session_id[:12] + "..." if len(session.session_id) > 15 else session.session_id
         
-        # Use full summary without truncation
-        summary_display = session.summary
+        # Use full summary and add session ID at bottom with simple line breaks
+        # Add newline every 50 characters
+        summary_text = session.summary
+        wrapped_lines = []
+        for line in summary_text.split('\n'):
+            if len(line) <= 50:
+                wrapped_lines.append(line)
+            else:
+                # Split long lines every 50 characters
+                for j in range(0, len(line), 50):
+                    wrapped_lines.append(line[j:j+50])
+        
+        wrapped_summary = '\n'.join(wrapped_lines)
+        
+        # Add continuation info if applicable
+        footer_parts = []
+        if session.is_continuation:
+            if session.continued_from_session:
+                footer_parts.append(f"Continued from: {session.continued_from_session[:8]}...")
+            else:
+                footer_parts.append("Continued from previous session")
+        footer_parts.append(session.session_id)
+        
+        summary_display = f"{wrapped_summary}\n\n{chr(10).join(footer_parts)}"
         
         # Color the row number
         row_num = f"{Fore.YELLOW}{i}{Style.RESET_ALL}"
@@ -382,10 +570,8 @@ def display_sessions(sessions: List[SessionFile], project_name: str) -> None:
         
         table_data.append([
             row_num,
-            date_str,
-            time_str,
+            datetime_str,
             msg_count,
-            session_id_display,
             summary_display
         ])
     
@@ -394,33 +580,86 @@ def display_sessions(sessions: List[SessionFile], project_name: str) -> None:
         table_data,
         headers=[f"{Fore.CYAN}{h}{Style.RESET_ALL}" for h in headers],
         tablefmt="fancy_grid",
-        colalign=["center", "center", "center", "center", "left", "left"],
-        maxcolwidths=[None, None, None, None, 15, 40]
+        colalign=["center", "center", "center", "left"]
     ))
     print()  # Add spacing after table
 
 
-def get_session_selection(sessions: List[SessionFile]) -> SessionFile:
+def get_session_selection(sessions: List[SessionFile]) -> Union[SessionFile, str, None]:
     """Get user's session selection"""
     while True:
         try:
-            choice = input(f"\nSelect session (1-{len(sessions)}) or 'q' to quit: ").strip()
+            choice = input(f"\nSelect session (1-{len(sessions)}) • 'r' re-cache • 'p' previous • 'q' quit: ").strip().lower()
             
-            if choice.lower() == 'q':
+            if choice == 'q':
                 print("Goodbye!")
                 sys.exit(0)
+            if choice == 'p':
+                return None
+            if choice == 'r':
+                return 'recache'
             
             index = int(choice) - 1
             if 0 <= index < len(sessions):
                 return sessions[index]
             else:
-                print(f"Please enter a number between 1 and {len(sessions)}")
+                print(f"Please enter a number between 1 and {len(sessions)}, 'r', 'p', or 'q'")
                 
         except ValueError:
-            print("Please enter a valid number or 'q' to quit")
+            print("Please enter a valid number, 'r', 'p', or 'q'")
         except KeyboardInterrupt:
             print("\nGoodbye!")
             sys.exit(0)
+
+
+def recache_sessions(sessions: List[SessionFile], cache: Dict) -> bool:
+    """Handle re-caching of sessions with user selection"""
+    print(f"\n{Fore.CYAN}Re-cache Session Summaries{Style.RESET_ALL}")
+    print("Choose which sessions to re-generate summaries for:")
+    print(f"  {Fore.YELLOW}all{Style.RESET_ALL} - Re-cache all sessions")
+    
+    for i, session in enumerate(sessions, 1):
+        session_id_display = session.session_id[:12] + "..." if len(session.session_id) > 15 else session.session_id
+        print(f"  {Fore.YELLOW}{i}{Style.RESET_ALL} - {session_id_display}")
+    
+    while True:
+        choice = input(f"\nEnter 'all' or session numbers (e.g., '1,3,5') or 'c' to cancel: ").strip().lower()
+        
+        if choice == 'c':
+            return False
+        
+        sessions_to_recache = []
+        
+        if choice == 'all':
+            sessions_to_recache = sessions
+        else:
+            try:
+                indices = [int(x.strip()) - 1 for x in choice.split(',')]
+                if all(0 <= i < len(sessions) for i in indices):
+                    sessions_to_recache = [sessions[i] for i in indices]
+                else:
+                    print(f"Please enter valid session numbers between 1 and {len(sessions)}")
+                    continue
+            except ValueError:
+                print("Please enter 'all', valid numbers separated by commas, or 'c' to cancel")
+                continue
+        
+        # Perform re-caching
+        print(f"\n{Fore.BLUE}Re-caching {len(sessions_to_recache)} session(s)...{Style.RESET_ALL}")
+        for i, session in enumerate(sessions_to_recache, 1):
+            print(f"Re-processing session {i}/{len(sessions_to_recache)} ({session.session_id[:8]}...)...", end='', flush=True)
+            
+            # Force reload conversations and regenerate summary
+            session.load_conversations()
+            content = session.extract_content_for_summary()
+            session.summary = summarize_with_claude(content)
+            
+            # Update cache
+            cache_summary(session, session.summary, cache)
+            print(f" {Fore.GREEN}✓{Style.RESET_ALL}")
+        
+        print(f"\n{Fore.GREEN}Re-caching complete!{Style.RESET_ALL}")
+        return True
 
 
 def delete_empty_sessions(sessions: List[SessionFile], project_dir: Path, cache: Dict) -> Tuple[List[SessionFile], Dict]:
@@ -469,11 +708,8 @@ def delete_empty_sessions(sessions: List[SessionFile], project_dir: Path, cache:
 def launch_session(session: SessionFile) -> None:
     """Launch Claude Code with the selected session"""
     try:
-        # Convert the encoded project name back to the actual file path
-        username = os.getenv('USER', 'user')
-        user_prefix = f'-Users-{username}-'
-        user_path = f'/Users/{username}/'
-        actual_project_path = session.project_dir.replace(user_prefix, user_path).replace('-', '/')
+        # Get the actual project path from the encoded name
+        actual_project_path = decode_project_path(session.project_dir)
         
         # Clean the session ID - remove any extra whitespace or characters
         clean_session_id = session.session_id.strip()
@@ -655,76 +891,91 @@ def main():
         print("Install it with: pip install claude-cli")
         print("\nContinuing anyway (session launching will fail)...\n")
     
-    print("Finding Claude Code projects...")
-    project_dirs = find_project_directories()
-    
-    if not project_dirs:
-        print("No Claude Code projects with sessions found!")
-        print(f"Make sure your projects directory contains .jsonl files: {CLAUDE_PROJECTS_DIR}")
-        return
-    
-    # Step 1: Display and select project directory
-    display_project_directories(project_dirs)
-    selected_project = get_project_selection(project_dirs)
-    
-    # Step 2: Find sessions in the selected project
-    print(f"\nFinding sessions in {selected_project.name}...")
-    sessions = find_session_files_in_project(selected_project)
-    
-    if not sessions:
-        print("No session files found in this project!")
-        return
-    
-    print(f"Found {len(sessions)} sessions. Loading summaries...")
-    
-    # Load cache for this specific project
-    cache = load_cache_for_project(selected_project)
-    cache_updated = False
-    
-    # Generate summaries for each session (use cache when possible)
-    for i, session in enumerate(sessions, 1):
-        print(f"Processing session {i}/{len(sessions)}...", end='', flush=True)
+    while True:
+        print("Finding Claude Code projects...")
+        project_dirs = find_project_directories()
         
-        # Try to get cached summary first
-        cached_summary = get_cached_summary(session, cache)
-        if cached_summary:
-            session.summary = cached_summary
-            print(" (cached) ✓")
-        else:
-            # Load conversations and generate new summary
-            session.load_conversations()
-            content = session.extract_content_for_summary()
-            session.summary = summarize_with_claude(content)
-            # Cache the new summary
-            cache_summary(session, session.summary, cache)
-            cache_updated = True
-            print(" ✓")
-    
-    # Always save cache after processing
-    save_cache_for_project(selected_project, cache)
-    
-    # Check for and optionally delete empty sessions
-    sessions, cache = delete_empty_sessions(sessions, selected_project, cache)
-    
-    # Save cache again after potential deletions
-    save_cache_for_project(selected_project, cache)
-    
-    if not sessions:
-        print("No sessions remaining after cleanup!")
-        return
-    
-    # Step 3: Display sessions and get user selection
-    display_name = selected_project.name
-    username = os.getenv('USER', 'user')
-    user_prefix = f'-Users-{username}-'
-    if display_name.startswith(user_prefix):
-        display_name = display_name.replace(user_prefix, '').replace('-', '/')
-    
-    display_sessions(sessions, display_name)
-    selected_session = get_session_selection(sessions)
-    
-    # Launch the selected session
-    launch_session(selected_session)
+        if not project_dirs:
+            print("No Claude Code projects with sessions found!")
+            print(f"Make sure your projects directory contains .jsonl files: {CLAUDE_PROJECTS_DIR}")
+            return
+        
+        # Step 1: Display and select project directory
+        display_project_directories(project_dirs)
+        selected_project = get_project_selection(project_dirs)
+        
+        while True:
+            # Step 2: Find sessions in the selected project
+            print(f"\nFinding sessions in {selected_project.name}...")
+            sessions = find_session_files_in_project(selected_project)
+            
+            if not sessions:
+                print("No session files found in this project!")
+                break
+            
+            print(f"Found {len(sessions)} sessions. Loading summaries...")
+            
+            # Load cache for this specific project
+            cache = load_cache_for_project(selected_project)
+            cache_updated = False
+            
+            # Generate summaries for each session (use cache when possible)
+            for i, session in enumerate(sessions, 1):
+                print(f"Processing session {i}/{len(sessions)}...", end='', flush=True)
+                
+                # Try to get cached summary first
+                cached_summary = get_cached_summary(session, cache)
+                if cached_summary:
+                    session.summary = cached_summary
+                    print(f" {Fore.GREEN}(cached) ✓{Style.RESET_ALL}")
+                else:
+                    # Load conversations and generate new summary
+                    session.load_conversations()
+                    content = session.extract_content_for_summary()
+                    session.summary = summarize_with_claude(content)
+                    # Cache the new summary
+                    cache_summary(session, session.summary, cache)
+                    cache_updated = True
+                    print(f" {Fore.BLUE}(new) ✓{Style.RESET_ALL}")
+            
+            # Always save cache after processing
+            save_cache_for_project(selected_project, cache)
+            
+            # Check for and optionally delete empty sessions
+            sessions, cache = delete_empty_sessions(sessions, selected_project, cache)
+            
+            # Save cache again after potential deletions
+            save_cache_for_project(selected_project, cache)
+            
+            if not sessions:
+                print("No sessions remaining after cleanup!")
+                break
+            
+            # Step 3: Display sessions and get user selection
+            display_name = decode_project_path(selected_project.name)
+            # Shorten for display
+            username = os.getenv('USER', 'user')
+            home_prefix = f'/Users/{username}/'
+            if display_name.startswith(home_prefix):
+                display_name = '~/' + display_name[len(home_prefix):]
+            
+            display_sessions(sessions, display_name)
+            selected_session = get_session_selection(sessions)
+            
+            if selected_session is None:
+                # User pressed 'p' to go back to project selection
+                break
+            elif selected_session == 'recache':
+                # User pressed 'r' to re-cache sessions
+                if recache_sessions(sessions, cache):
+                    # Save updated cache after re-caching
+                    save_cache_for_project(selected_project, cache)
+                # Continue the loop to show updated sessions
+                continue
+            
+            # Launch the selected session
+            launch_session(selected_session)
+            return  # Exit after launching session
 
 
 if __name__ == "__main__":
