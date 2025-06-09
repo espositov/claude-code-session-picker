@@ -135,7 +135,6 @@ class SessionFile:
     
     def extract_content_for_summary(self) -> str:
         """Extract key topics and actions for AI summarization - prioritize user messages"""
-        content_parts = []
         
         # Look for existing summary entries but only use if they're descriptive
         summaries = [conv.get('summary', '') for conv in self.conversations
@@ -166,8 +165,12 @@ class SessionFile:
             last_two = user_messages[-2:]
             # Take 2 messages from around the middle
             mid_point = total_user_msgs // 2
-            middle_two = user_messages[mid_point-1:mid_point+1] if mid_point > 1 else []
+            middle_two = user_messages[mid_point - 1 : mid_point + 1] if mid_point > 1 else []
             priority_user_messages = first_two + middle_two + last_two
+
+        priority_conversations = [
+            conv for conv in self.conversations if not conv.get("isSidechain", False)
+        ]
         
         # Step 1: Extract user requests - take first 200 chars of each message
         user_requests = []
